@@ -6,6 +6,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -48,7 +49,7 @@ const TRANSFER_PLAINTEXT_SIZE: usize = 1024 * 1024;
 ///
 /// More specifically, great part of the noise in resumed handshakes comes from the usage of
 /// [`rustls::client::ClientSessionMemoryCache`] and [`rustls::server::ServerSessionMemoryCache`],
-/// which rely on a randomized `HashMap` under the hood (you can check for yourself by that
+/// which rely on a randomized `HashMap` under the hood (you can check for yourself by replacing that
 /// `HashMap` by a `FxHashMap`, which brings the noise down to acceptable levels in a single run).
 const RESUMED_HANDSHAKE_RUNS: usize = 30;
 
@@ -67,6 +68,30 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    #[command(subcommand)]
+    Icount(IcountCommand),
+    #[command(subcommand)]
+    Walltime(WalltimeCommand),
+}
+
+#[derive(Subcommand)]
+pub enum WalltimeCommand {
+    /// Run all benchmarks and store the measured wall times in CSV format (???)
+    RunAll {
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Compare the results from two previous benchmark runs and print a user-friendly markdown overview
+    Compare {
+        /// Path to the directory with the results of a previous `run-all` execution
+        baseline_dir: PathBuf,
+        /// Path to the directory with the results of a previous `run-all` execution
+        candidate_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IcountCommand {
     /// Run all benchmarks and prints the measured CPU instruction counts in CSV format
     RunAll {
         #[arg(short, long)]
@@ -100,11 +125,20 @@ impl Side {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let benchmarks = all_benchmarks()?;
 
-    let cli = Cli::parse();
     match cli.command {
-        Command::RunAll { output_dir } => {
+        Command::Icount(cmd) => run_icount(cmd, benchmarks)?,
+        Command::Walltime(cmd) => run_walltime(cmd, benchmarks)?,
+    }
+
+    Ok(())
+}
+
+fn run_icount(command: IcountCommand, benchmarks: Vec<Benchmark>) -> anyhow::Result<()> {
+    match command {
+        IcountCommand::RunAll { output_dir } => {
             let executable = std::env::args().next().unwrap();
             let output_dir = output_dir.unwrap_or("target/ci-bench".into());
             let results = run_all(executable, output_dir.clone(), &benchmarks)?;
@@ -116,7 +150,7 @@ fn main() -> anyhow::Result<()> {
                 writeln!(csv_file, "{name},{instr_count}")?;
             }
         }
-        Command::RunSingle { index, side } => {
+        IcountCommand::RunSingle { index, side } => {
             // `u32::MAX` is used as a signal to do nothing and return. By "running" an empty
             // benchmark we can measure the startup overhead.
             if index == u32::MAX {
@@ -174,7 +208,7 @@ fn main() -> anyhow::Result<()> {
             mem::forget(stdin);
             mem::forget(stdout);
         }
-        Command::Compare {
+        IcountCommand::Compare {
             baseline_dir,
             candidate_dir,
         } => {
@@ -189,6 +223,50 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Noteworthy instruction count differences found. Check the job summary for details.");
                 std::process::exit(2);
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_walltime(command: WalltimeCommand, benchmarks: Vec<Benchmark>) -> anyhow::Result<()> {
+    match command {
+        WalltimeCommand::RunAll { output_dir } => {
+            let output_dir = output_dir.unwrap_or("target/ci-bench".into());
+            let results = run_all_walltime(&benchmarks)?;
+
+            // Output results in CSV (note: not using a library here to avoid extra dependencies)
+            let mut csv_file = File::create(output_dir.join(ICOUNTS_FILENAME))
+                .context("cannot create output csv file")?;
+            for (name, instr_count) in results {
+                let timings = instr_count.iter().map(|t| t.as_micros().to_string()).join(",");
+                writeln!(csv_file, "{name},{timings}")?;
+            }
+        }
+        WalltimeCommand::Compare {
+            baseline_dir,
+            candidate_dir: _,
+        } => {
+            let baseline = read_results_walltime(&baseline_dir.join(ICOUNTS_FILENAME))?;
+            for bench in &benchmarks {
+                let Some(results) = baseline.get(bench.name()) else {
+                    continue;
+                };
+
+                let avg = results.iter().sum::<u64>() / results.len() as u64;
+                println!("{} = {avg} µs", bench.name());
+            }
+
+            // let candidate = read_results_walltime(&candidate_dir.join(ICOUNTS_FILENAME))?;
+            // let result = compare_results(&baseline_dir, &candidate_dir, &baseline, &candidate)?;
+            // print_report(&result);
+
+            // if !result.noteworthy.is_empty() {
+            //     // Signal to the parent process that there are noteworthy instruction count
+            //     // differences (exit code 1 is already used when main returns an error)
+            //     eprintln!("Noteworthy instruction count differences found. Check the job summary for details.");
+            //     std::process::exit(2);
+            // }
         }
     }
 
@@ -320,6 +398,77 @@ pub fn run_all(
     }
 
     Ok(measurements)
+}
+
+/// Run all the provided benches natively to retrieve their walltime
+pub fn run_all_walltime(
+    benches: &[Benchmark],
+) -> anyhow::Result<Vec<(String, Vec<Duration>)>> {
+    // Easiest path:
+    // - Duplicate everything
+    // - Figure out if this is what we need (e.g. the measurements have the right distribution, we can compare between them, etc)
+    // - Make it more beautiful later (probably async / await would allow us to generalize the code)
+
+    let local_buf = &mut [0u8; 262144];
+    let io_buf = &mut [0u8; 262144];
+    let mut results = Vec::new();
+    for bench in benches {
+        let BenchmarkKind::Handshake(ResumptionKind::No) = bench.kind else {
+            continue;
+        };
+
+        let params = black_box(bench.params);
+        let client_config = ClientSideStepper::make_config(&params, ResumptionKind::No);
+        let server_config = ServerSideStepper::make_config(&params, ResumptionKind::No);
+
+        let mut durations = Vec::with_capacity(50);
+        for _ in 0..50 {
+            // Client
+            let server_name = "localhost".try_into().unwrap();
+            let mut client = ClientConnection::new(client_config.clone(), server_name).unwrap();
+            client.set_buffer_limit(None);
+
+            // Server
+            let mut server = ServerConnection::new(server_config.clone()).unwrap();
+            server.set_buffer_limit(None);
+
+            let start = Instant::now();
+            loop {
+                // Client send message
+                let data_sent = send_handshake_message(&mut client, &mut io_buf.as_mut(), local_buf)?;
+
+                // Server read message
+                if data_sent {
+                    read_handshake_message(&mut server, &mut io_buf.as_ref(), local_buf)?;
+                }
+
+                if !client.is_handshaking() && !client.wants_write() && !server.is_handshaking() {
+                    break;
+                }
+
+                // Server send message
+                send_handshake_message(&mut server, &mut io_buf.as_mut(), local_buf)?;
+
+                // Client read message
+                read_handshake_message(&mut client, &mut io_buf.as_ref(), local_buf)?;
+            }
+
+            durations.push(Instant::now() - start);
+            assert!(!server.is_handshaking());
+        }
+
+        results.push((bench.name().to_string(), durations));
+    }
+
+    // Gather results keeping the original order of the benchmarks
+    // let mut measurements = Vec::new();
+    // for bench in benches {
+    //     let instr_counts = get_reported_instr_count(bench, &results);
+    //     measurements.push((bench.name_with_side(Side::Server), instr_counts.server));
+    //     measurements.push((bench.name_with_side(Side::Client), instr_counts.client));
+    // }
+
+    Ok(results)
 }
 
 /// Drives the different steps in a benchmark.
@@ -551,6 +700,32 @@ fn read_results(path: &Path) -> anyhow::Result<HashMap<String, u64>> {
                 .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
                 .parse()
                 .context("Unable to parse instruction count from CSV")?,
+        );
+    }
+
+    Ok(measurements)
+}
+
+/// Reads the (benchmark, walltime) info from previous CSV output
+fn read_results_walltime(path: &Path) -> anyhow::Result<HashMap<String, Vec<u64>>> {
+    let file = File::open(path).context(format!(
+        "CSV file for comparison not found: {}",
+        path.display()
+    ))?;
+
+    let mut measurements = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.context("Unable to read results from CSV file")?;
+        let line = line.trim();
+        let mut parts = line.split(',');
+        let name = parts
+            .next()
+            .ok_or(anyhow::anyhow!("CSV is wrongly formatted"))?
+            .to_string();
+        let walltimes: Result<Vec<_>, _> = parts.map(|p| p.parse()).collect();
+        measurements.insert(
+            name,
+            walltimes.context("Unable to parse instruction count from CSV")?,
         );
     }
 

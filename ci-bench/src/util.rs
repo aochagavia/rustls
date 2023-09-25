@@ -64,7 +64,7 @@ pub mod transport {
         conn: &mut ConnectionCommon<T>,
         writer: &mut dyn Write,
         buf: &mut [u8],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         // Write all bytes the connection wants to send to an intermediate buffer
         let mut written = 0;
         while conn.wants_write() {
@@ -79,7 +79,7 @@ pub mod transport {
         }
 
         if written == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         // Write the whole buffer in one go, preceded by its length
@@ -87,7 +87,7 @@ pub mod transport {
         writer.write_all(&buf[..written])?;
         writer.flush()?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Receives one side's handshake data to the other side in one go.
