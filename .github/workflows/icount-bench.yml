@@ -15,6 +15,12 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Show gcc version
+        run: gcc --version
+
+      - name: Show clang version (if available)
+        run: clang --version
+
       - name: Checkout PR
         uses: actions/checkout@v4
         with:
@@ -23,15 +29,5 @@ jobs:
       - name: Run icount benchmarks for PR
         run: cd ci-bench && cargo run --locked --release -- run-all --output-dir ${{ runner.temp }}/pr
 
-      - name: Checkout ${{ github.base_ref }}
-        uses: actions/checkout@v4
-        with:
-          clean: false
-          ref: ${{ github.base_ref }}
-          persist-credentials: false
-
-      - name: Run icount benchmarks for ${{ github.base_ref }}
-        run: cd ci-bench && cargo run --locked --release -- run-all --output-dir ${{ runner.temp }}/base
-
-      - name: Compare results
-        run: cd ci-bench && cargo run --locked --release -- compare ${{ runner.temp }}/base ${{ runner.temp }}/pr > $GITHUB_STEP_SUMMARY
+      - name: Show compiler used for ring's C bits
+        run: ls target/release/deps/libring-*.rlib | xargs objdump --full-contents --section=.comment
