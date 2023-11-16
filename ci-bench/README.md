@@ -1,14 +1,17 @@
 # CI Bench
 
-This crate is meant for CI benchmarking. It measures CPU instructions using `cachegrind`, outputs
-the results in CSV format and allows comparing results from multiple runs.
+This crate is meant for CI benchmarking. It has two modes of operation:
+
+1. Measure CPU instructions using `cachegrind`.
+2. Measure wall-time (runs each benchmark multiple times, leaving it to the caller to do statistical
+   analysis).
 
 ## Usage
 
 You can get detailed usage information through `cargo run --release -- --help`. Below are the most
 important bits.
 
-### Running all benchmarks
+### Running all benchmarks in instruction count mode
 
 _Note: this step requires having `valgrind` in your path._
 
@@ -37,7 +40,24 @@ are useful to report detailed instruction count differences when comparing two b
 subdirectory also contains log information from cachegrind itself (in `.log` files), which can be
 used to diagnose unexpected cachegrind crashes.
 
-### Comparing results
+### Running all benchmarks in wall-time mode
+
+Use `cargo run --release -- walltime --iterations-per-scenario 3` to print the CSV results to stdout
+(we use 3 iterations here for demonstration purposes, but recommend 100 iterations to deal with
+noise). The output should look like the following (one column per iteration):
+
+```csv
+handshake_no_resume_ring_1.2_rsa_aes,6035261,1714158,977368
+handshake_session_id_ring_1.2_rsa_aes,1537632,2445849,1766888
+handshake_tickets_ring_1.2_rsa_aes,1553743,2418286,1636431
+transfer_no_resume_ring_1.2_rsa_aes,10192862,10374258,8988854
+handshake_no_resume_ring_1.3_rsa_aes,1010150,1400602,936029
+...
+... rest omitted for brevity
+...
+```
+
+### Comparing results from an instruction count benchmark run
 
 Use `cargo run --release -- compare foo bar`. It will output a report using GitHub-flavored markdown
 (used by the CI itself to give feedback about PRs). We currently consider differences of 0.2% to be
@@ -62,17 +82,18 @@ with names like `transfer_no_resume_1.3_rsa_aes_client`.
 We have made an effort to heavily document the source code of the benchmarks. In addition to that,
 here are some high-level considerations that can help you hack on the crate.
 
-### Architecture
+### Environment configuration
 
-An important goal of this benchmarking setup is that it should run with minimum noise on
-standard GitHub Actions runners. We achieve that by measuring CPU instructions using `cachegrind`,
-which runs fine on the cloud (contrary to hardware instruction counters). This is the same
-approach used by the [iai](https://crates.io/crates/iai) benchmarking crate, but we needed more
-flexibility and have therefore rolled our own setup.
+An important goal of this benchmarking setup is that it should run with minimal noise. Measuring CPU
+instructions using `cachegrind` yields excellent results, regardless of your environment. The
+wall-time benchmarks, however, require a well-configured benchmarking environment (we are using a
+bare-metal server).
+
+### Architecture
 
 Using `cachegrind` has some architectural consequences because it operates at the process level
 (i.e. it can count CPU instructions for a whole process, but not for a single function). The
-most important consequences are:
+most important consequences when running in instruction count mode are:
 
 - Since we want to measure server and client instruction counts separately, the benchmark runner
   spawns two child processes for each benchmark (one for the client, one for the server) and pipes
@@ -85,18 +106,22 @@ most important consequences are:
   subtracted from it. We are currently using this to subtract the handshake instructions from the
   data transfer benchmark.
 
+Contrary to the instruction count mode, the wall-time mode benefits from running the benchmarks in a
+single process (in a single thread). We use async / await syntax in the benchmarked code, together
+with custom future drivers, as a way to make the code blocking (when the connections communicate
+through stdout) or non-blocking (when the connections communicate through an in-memory buffer).
+
 ### Debugging
 
 If you need to debug the crate, here are a few tricks that might help:
 
-- For printf debugging, you should use `eprintln!`, because child processes use stdio as the
-  transport for the TLS connection (i.e. if you print something to stdout, you won't even see it
-  _and_ the other side of the connection will choke on it).
-- When using a proper debugger, remember that each side of the connection runs as a child process.
-  If necessary, you can tweak the code to ensure both sides of the connection run on the parent
-  process (e.g. by starting each side on its own thread and having them communicate through TCP).
-  This should require little effort, because the TLS transport layer is encapsulated and generic
-  over `Read` and `Write`.
+- For printf debugging in instruction count mode, you should use `eprintln!`, because child
+  processes use stdio as the transport for the TLS connection (i.e. if you print something to
+  stdout, you won't even see it _and_ the other side of the connection will choke on it).
+- When using a proper debugger, remember that in instruction count mode each side of the connection
+  runs as a child process.
+- Because of the above, the easiest way to debug the crate is by running the benchmarks in wall-time
+  mode.
 
 ### Why measure CPU instructions
 
