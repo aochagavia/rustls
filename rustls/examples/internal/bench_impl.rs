@@ -14,20 +14,229 @@ use std::time::{Duration, Instant};
 use pki_types::{CertificateDer, PrivateKeyDer};
 
 use rustls::client::Resumption;
-#[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
-use rustls::crypto::aws_lc_rs as provider;
-#[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
-use rustls::crypto::aws_lc_rs::{cipher_suite, Ticketer};
-#[cfg(feature = "ring")]
-use rustls::crypto::ring as provider;
-#[cfg(feature = "ring")]
-use rustls::crypto::ring::{cipher_suite, Ticketer};
+// #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+// use rustls::crypto::aws_lc_rs as provider;
+// #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+// use rustls::crypto::aws_lc_rs::{cipher_suite, Ticketer};
+// #[cfg(feature = "ring")]
+// use rustls::crypto::ring as provider;
+// #[cfg(feature = "ring")]
+use rustls::crypto::ring::{Ticketer};
 use rustls::crypto::CryptoProvider;
 use rustls::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
 use rustls::RootCertStore;
 use rustls::{ClientConfig, ClientConnection};
 use rustls::{ConnectionCommon, SideData};
 use rustls::{ServerConfig, ServerConnection};
+
+// mod provider {
+//     use std::sync::Arc;
+//     use pki_types::PrivateKeyDer;
+//     use ring::error::Unspecified;
+//     use ring::rand::SecureRandom;
+//     use rustls::crypto::{CryptoProvider, KeyProvider};
+//     use rustls::Error;
+//     use rustls::sign::SigningKey;
+//
+//     struct NoOpKeyProvider;
+//
+//     impl KeyProvider for NoOpKeyProvider {
+//         fn load_private_key(&self, key_der: PrivateKeyDer<'static>) -> Result<Arc<dyn SigningKey>, Error> {
+//             todo!()
+//         }
+//     }
+//
+//     // /// Source of cryptographically secure random numbers.
+//     // pub secure_random: &'static dyn SecureRandom,
+//     //
+//     // /// Provider for loading private [SigningKey]s from [PrivateKeyDer].
+//     // pub key_provider: &'static dyn KeyProvider,
+//
+//     pub fn default_provider() -> CryptoProvider {
+//         CryptoProvider {
+//             cipher_suites: DEFAULT_CIPHER_SUITES.to_vec(),
+//             kx_groups: ALL_KX_GROUPS.to_vec(),
+//             signature_verification_algorithms: SUPPORTED_SIG_ALGS,
+//             secure_random: &Ring,
+//             key_provider: &Ring,
+//         }
+//     }
+// }
+
+mod provider {
+    use rustls::crypto::CryptoProvider;
+    use crate::bench_impl::cipher_suite::TLS13_AES_256_GCM_SHA384;
+
+    pub fn default_provider() -> CryptoProvider {
+        CryptoProvider {
+            cipher_suites: vec![
+                TLS13_AES_256_GCM_SHA384,
+            ],
+            ..rustls::crypto::ring::default_provider()
+        }
+    }
+}
+
+mod cipher_suite {
+    use rustls::{CipherSuite, ConnectionTrafficSecrets, crypto, Error, SupportedCipherSuite, Tls13CipherSuite};
+    use rustls::crypto::cipher::{AeadKey, BorrowedPlainMessage, Iv, MessageDecrypter, MessageEncrypter, OpaqueMessage, PlainMessage, Tls13AeadAlgorithm, UnsupportedOperationError};
+    use rustls::crypto::CipherSuiteCommon;
+    use rustls::crypto::hash::{Context, Hash, HashAlgorithm, Output};
+    use rustls::crypto::hmac::Tag;
+    use rustls::internal::msgs::base::Payload;
+
+    struct NoOpCipherSuite;
+    struct NoOpHash;
+    struct NoOpHashContext;
+    struct NoOpHkdf;
+    struct NoOpHkdfExpander;
+    struct NoOpAeadAlg;
+    struct NoOpMessageEncrypter;
+    struct NoOpMessageDecrypter;
+
+    impl MessageEncrypter for NoOpMessageEncrypter {
+        fn encrypt(&mut self, msg: BorrowedPlainMessage, seq: u64) -> Result<OpaqueMessage, Error> {
+            Ok(OpaqueMessage::new(msg.typ, msg.version, msg.payload.to_vec()))
+        }
+
+        fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+            payload_len
+        }
+    }
+
+    impl MessageDecrypter for NoOpMessageDecrypter {
+        fn decrypt(&mut self, msg: OpaqueMessage, seq: u64) -> Result<PlainMessage, Error> {
+            Ok(PlainMessage { typ: msg.typ, version: msg.version, payload: Payload::new(msg.payload()) })
+        }
+    }
+
+    impl Tls13AeadAlgorithm for NoOpAeadAlg {
+        fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
+            Box::new(NoOpMessageEncrypter)
+        }
+
+        fn decrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageDecrypter> {
+            Box::new(NoOpMessageDecrypter)
+        }
+
+        fn key_len(&self) -> usize {
+            32
+        }
+
+        fn extract_keys(&self, key: AeadKey, iv: Iv) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+            Err(UnsupportedOperationError)
+        }
+    }
+
+    impl crypto::tls13::Hkdf for NoOpHkdf {
+        fn extract_from_zero_ikm(&self, salt: Option<&[u8]>) -> Box<dyn crypto::tls13::HkdfExpander> {
+            Box::new(NoOpHkdfExpander)
+        }
+
+        fn extract_from_secret(&self, salt: Option<&[u8]>, secret: &[u8]) -> Box<dyn crypto::tls13::HkdfExpander> {
+            Box::new(NoOpHkdfExpander)
+        }
+
+        fn expander_for_okm(&self, okm: &crypto::tls13::OkmBlock) -> Box<dyn crypto::tls13::HkdfExpander> {
+            Box::new(NoOpHkdfExpander)
+        }
+
+        fn hmac_sign(&self, key: &crypto::tls13::OkmBlock, message: &[u8]) -> Tag {
+            Tag::new(&[0; 48])
+        }
+    }
+
+    impl crypto::tls13::HkdfExpander for NoOpHkdfExpander {
+        fn expand_slice(&self, info: &[&[u8]], output: &mut [u8]) -> Result<(), crypto::tls13::OutputLengthError> {
+            Ok(())
+        }
+
+        fn expand_block(&self, info: &[&[u8]]) -> crypto::tls13::OkmBlock {
+            crypto::tls13::OkmBlock::new(&[0; 48])
+        }
+
+        fn hash_len(&self) -> usize {
+            48
+        }
+    }
+
+    impl Hash for NoOpHash {
+        fn start(&self) -> Box<dyn Context> {
+            Box::new(NoOpHashContext)
+        }
+
+        fn hash(&self, data: &[u8]) -> Output {
+            Output::new(&[0; 48])
+        }
+
+        fn output_len(&self) -> usize {
+            48
+        }
+
+        fn algorithm(&self) -> HashAlgorithm {
+            HashAlgorithm::SHA384
+        }
+    }
+
+    impl Context for NoOpHashContext {
+        fn fork_finish(&self) -> Output {
+            Output::new(&[0; 48])
+        }
+
+        fn fork(&self) -> Box<dyn Context> {
+            Box::new(NoOpHashContext)
+        }
+
+        fn finish(self: Box<Self>) -> Output {
+            Output::new(&[0; 48])
+        }
+
+        fn update(&mut self, data: &[u8]) {}
+    }
+
+    static HASH_PROVIDER: &dyn Hash = &NoOpHash;
+    static HKDF_PROVIDER: &dyn crypto::tls13::Hkdf = &NoOpHkdf;
+    static AEAD_ALG: &dyn Tls13AeadAlgorithm = &NoOpAeadAlg;
+
+    // fn tls_12_cipher_suite() -> SupportedCipherSuite {
+    //     SupportedCipherSuite::Tls12(&SUITE)
+    // }
+
+    // fn tls_13_cipher_suite() -> SupportedCipherSuite {
+    //     static SUITE: Tls13CipherSuite = Tls13CipherSuite {
+    //         common: CipherSuiteCommon {
+    //             suite: CipherSuite::TLS_NULL_WITH_NULL_NULL,
+    //             hash_provider: HASH_PROVIDER,
+    //             confidentiality_limit: u64::MAX,
+    //             integrity_limit: u64::MAX,
+    //         },
+    //         hkdf_provider: HKDF_PROVIDER,
+    //         aead_alg: AEAD_ALG,
+    //         quic: None,
+    //     };
+    //
+    //     SupportedCipherSuite::Tls13(&SUITE)
+    // }
+
+    // const TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite = tls_12_cipher_suite();
+    // const TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: SupportedCipherSuite = tls_12_cipher_suite();
+    // const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite = tls_12_cipher_suite();
+    // const TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite = tls_12_cipher_suite();
+    // const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite = tls_12_cipher_suite();
+    // const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: SupportedCipherSuite = tls_12_cipher_suite();
+    // static TLS13_CHACHA20_POLY1305_SHA256: SupportedCipherSuite = tls_13_cipher_suite();
+    pub static TLS13_AES_256_GCM_SHA384: SupportedCipherSuite = SupportedCipherSuite::Tls13(&Tls13CipherSuite {
+        common: CipherSuiteCommon {
+            suite: CipherSuite::TLS13_AES_256_GCM_SHA384,
+            hash_provider: HASH_PROVIDER,
+            confidentiality_limit: u64::MAX,
+            integrity_limit: u64::MAX,
+        },
+        hkdf_provider: HKDF_PROVIDER,
+        aead_alg: AEAD_ALG,
+        quic: None,
+    });
+}
 
 pub fn main() {
     let mut args = std::env::args();
@@ -190,73 +399,73 @@ impl BenchmarkParam {
 }
 
 static ALL_BENCHMARKS: &[BenchmarkParam] = &[
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Ecdsa,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Ecdsa,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        &rustls::version::TLS12,
-    ),
-    #[cfg(feature = "tls12")]
-    BenchmarkParam::new(
-        KeyType::Ecdsa,
-        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        &rustls::version::TLS12,
-    ),
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-        &rustls::version::TLS13,
-    ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Ecdsa,
+    //     cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Ecdsa,
+    //     cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    //     &rustls::version::TLS12,
+    // ),
+    // #[cfg(feature = "tls12")]
+    // BenchmarkParam::new(
+    //     KeyType::Ecdsa,
+    //     cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    //     &rustls::version::TLS12,
+    // ),
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+    //     &rustls::version::TLS13,
+    // ),
     BenchmarkParam::new(
         KeyType::Rsa,
         cipher_suite::TLS13_AES_256_GCM_SHA384,
         &rustls::version::TLS13,
     ),
-    BenchmarkParam::new(
-        KeyType::Rsa,
-        cipher_suite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
-    ),
-    BenchmarkParam::new(
-        KeyType::Ecdsa,
-        cipher_suite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
-    ),
-    BenchmarkParam::new(
-        KeyType::Ed25519,
-        cipher_suite::TLS13_AES_128_GCM_SHA256,
-        &rustls::version::TLS13,
-    ),
+    // BenchmarkParam::new(
+    //     KeyType::Rsa,
+    //     cipher_suite::TLS13_AES_128_GCM_SHA256,
+    //     &rustls::version::TLS13,
+    // ),
+    // BenchmarkParam::new(
+    //     KeyType::Ecdsa,
+    //     cipher_suite::TLS13_AES_128_GCM_SHA256,
+    //     &rustls::version::TLS13,
+    // ),
+    // BenchmarkParam::new(
+    //     KeyType::Ed25519,
+    //     cipher_suite::TLS13_AES_128_GCM_SHA256,
+    //     &rustls::version::TLS13,
+    // ),
 ];
 
 impl KeyType {
